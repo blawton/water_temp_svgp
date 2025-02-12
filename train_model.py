@@ -10,7 +10,7 @@ import tensorflow as tf
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import GroupKFold as groupkfold
-from build_functions import get_splits, get_folds
+from build_functions import get_splits, get_folds, standardize
 #
 
 # Additional requirements for SVGP
@@ -42,26 +42,27 @@ M=1000
 batch_size = 32
 # minibatch size for estimating ELBO
 # minibatch_size=100
-epochs_per_fold=40
-logging_epoch_freq=10
+epochs_per_fold=25
+logging_epoch_freq=5
 # This next condition enforces 1 graph/fold post training
-graphing_epoch_freq=10
+graphing_epoch_freq=5
 # maximum iterations
 maxiter=10000
 
 #These are dependent on specific version of the model
-indep_var=["Day", "Overall_Day", "Latitude", "Longitude", "embay_dist", "minute_of_day"]
+indep_var=["Day", "Overall_Day", "Latitude", "Longitude", "embay_dist", "minute_of_day"] + years
+exclude_dims = overall_time_dim + minute_dim + [indep_var.index(year) for year in years]
 area="ES"
 method="SVGP"
 spatial_pca= False
-notes="Like 4.1 but now using dataset without outliers and shuffled folds."
-model_name="4.2"
+notes="Now uses separate dimensions for each year and a sin kernel for each year."
+model_name="4.6"
 within_year_vars = np.setdiff1d(np.arange(len(indep_var)), np.array(overall_time_dim + minute_dim))
 # Characteristic Map
 characteristic_names = ['Kernel', 'Optimizer', 'Fold', 'Year', 'Independent Vars', 'Area', 'Method', 'Spatial PCA', 'Model Name', 'Notes', 'Inducing Locations', 'Epochs/Fold', 'Inducing Variables']
 
 #Date
-date = "12_26_2024"
+date = "12_28_2024"
 
 #Filename
 filename="agg_daily_morning_w_time_coastal_features_v2.csv"
@@ -81,6 +82,10 @@ df.loc[df["Organization"].isin(["EPA_FISM", "STS_Tier_II", "USGS_Cont"]), "Conti
 df["Date"]=pd.to_datetime(df["Date"])
 df["Day"]=df["Date"].dt.day_of_year
 df["Year"]=df["Date"].dt.year
+
+for year in years:
+    df[year]=(df["Year"]==year)
+    df[year]=df[year].astype(int)
 
 # Adding in Overall_Day in addition to Day (new in v3.1)
 df["Overall_Day"]= 365*(df["Year"]-min(years)) + df["Day"]
@@ -124,18 +129,29 @@ def get_kernels():
   rbf_2= gpflow.kernels.RBF(lengthscales=[1]*len(within_year_vars),
                           active_dims=within_year_vars)
 
-## Kernels using overall day within time period
-  rbf_time_1= gpflow.kernels.RBF(lengthscales=[1]*len(overall_time_dim),
-                        active_dims=overall_time_dim)
-  rbf_time_2= gpflow.kernels.RBF(lengthscales=[1]*len(overall_time_dim),
-                        active_dims=overall_time_dim)
-  rbf_time_3= gpflow.kernels.RBF(lengthscales=[1]*len(overall_time_dim),
-                        active_dims=overall_time_dim)
-  rbf_time_4= gpflow.kernels.RBF(lengthscales=[1]*len(overall_time_dim),
-                        active_dims=overall_time_dim)
+## Kernel using overall day within time period
+  # Getting expected std of overall_time_dim to match lengthscale
+  # var_uniform = 1/12*np.square((len(years)-1)*365)
 
-## Kernels using cyclical day of year
-  sin_1 = gpflow.kernels.Cosine(lengthscales=[365], active_dims=time_dim)
+  # rbf_time_1= gpflow.kernels.RBF(lengthscales=[1]*len(overall_time_dim),
+  #                       active_dims=overall_time_dim)
+  # rbf_time_2= gpflow.kernels.RBF(lengthscales=[1]*len(overall_time_dim),
+  #                       active_dims=overall_time_dim)
+  # rbf_time_3= gpflow.kernels.RBF(lengthscales=[1]*len(overall_time_dim),
+  #                       active_dims=overall_time_dim)
+
+  temp1 = gpflow.kernels.Linear(variance= 1, active_dims=[indep_var.index(years[0])])
+  temp2 = gpflow.kernels.Cosine(lengthscales=[365], active_dims=[indep_var.index(years[0])])
+  sin_lin = temp1*temp2
+  if len(years)>=1:
+      for year in years[1:]:
+          temp1 = gpflow.kernels.Linear(variance=1, active_dims=[indep_var.index(year)])
+          temp2 = gpflow.kernels.Cosine(lengthscales=[365], active_dims=overall_time_dim)
+          sin_lin += temp1*temp2
+  # print(sin_lin)
+
+## Kernels using overall day of year
+  # sin_1 = gpflow.kernels.Cosine(lengthscales=[365], active_dims=overall_time_dim)
 
   ## Kernels using cyclical time of day
   sin_2 = gpflow.kernels.Cosine(lengthscales=[1440], active_dims=minute_dim)
@@ -146,7 +162,7 @@ def get_kernels():
       # "matern32_rbf_intra": matern32_1 + rbf_time_1
       # "matern32_rbf_intra_sin": matern32_2 + rbf_time_2 + sin_1
       # "rbf_matern32_plus": rbf_1 + matern32_3 + rbf_time_3
-      "rbf_rbf_matern32_sin": rbf_2 + matern32_4 + rbf_time_4 + sin_1 + sin_2
+      "rbf_matern32_sin_lin_sin": rbf_2 + matern32_4 + sin_lin + sin_2
       # "rbf_rq": rbf_3 + rq_1,
       # "matern32_rq": matern32_3 +rq_2
   }
@@ -166,31 +182,6 @@ def get_opt():
 
 #Test method
 get_opt()
-
-#
-
-#Standardize Data
-def standardize(X, y):
-  Xmean=np.mean(X, axis=0)
-  Xstd=np.std(X, axis=0)
-  ymean=np.mean(y)
-
-#  Hardcoding the cyclical time dimension to have no scaling applied
-  if len(X.shape)>1:
-
-    Xmean[time_dim] = 0
-    Xstd[time_dim] = 1
-
-    Xmean[minute_dim] = 0
-    Xstd[minute_dim] = 1
-
-  X_s=(X-Xmean)/Xstd
-  y_s=y-ymean
-
-  return(X_s, y_s, ymean)
-
-#Test method
-print(standardize(np.arange(1,10), np.arange(1,10)*10))
 
 #
 
@@ -217,8 +208,8 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
     kernels=get_kernels()
     for k_name, kernel in kernels.items():
       #Normalizing (seperately for train and test vars)
-      Xtrain_s, ytrain_s, ytrain_mean =standardize(Xtrain, ytrain)
-      Xtest_s, ytest_s, ytest_mean =standardize(Xtest, ytest)
+      Xtrain_s, _, ytrain_s, ytrain_mean, ytrain_std =standardize(Xtrain, ytrain, exclude_dims=exclude_dims)
+      Xtest_s, _, ytest_s, ytest_mean, ytest_std =standardize(Xtest, ytest, exclude_dims=exclude_dims)
       start_time=datetime.datetime.now()
 
       #Tensor for ELBO calculation
@@ -243,10 +234,15 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
 
       # Setting whether or not parameters are trainable
 
-      ## Cyclical Sin
+      ## Setting all cyclical lengthscales to non-trainable
       if k_name[-3:]=="sin":
+        # Handling minute of the day
         gpflow.utilities.set_trainable(m.kernel.kernels[-1].lengthscales, False)
-        gpflow.utilities.set_trainable(m.kernel.kernels[-2].lengthscales, False)
+
+        # Handling day of the year kernels with multiple dimensions
+        for i in range(len(years)):
+            gpflow.utilities.set_trainable(m.kernel.kernels[-(2 + i)].kernels[1].lengthscales, False)
+            gpflow.utilities.set_trainable(m.kernel.kernels[-(2 + i)].kernels[1].variance, False)
       #   gpflow.utilities.set_trainable(m.kernel.kernels[-1].variance, False)
 
       ## Inducing variables
@@ -310,17 +306,19 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
 
         ## Predicting for monitoring
         pred_mean, pred_var = m.predict_y(Xtest_s)
+        pred_mean = pred_mean*ytrain_std + ytrain_mean
+        pred_var = pred_var*(ytrain_std**2)
 
-        # ## Graphing
-        # fig, ax = plt.subplots()
-        # ax.set_title(k_name)
-        # ax.scatter(Xtest_s[:, overall_time_dim], pred_mean, c = 'Red', alpha=.15)
-        # ax.scatter(Xtest_s[:, overall_time_dim], ytest_s, c='Blue', alpha=.15)
-        # plt.savefig(model_name + "_" + "_".join([k_name,
-        #                                        o_name,
-        #                                        str(fold),
-        #                                        str(year),
-        #                                        ]) + ".png")
+        ## Graphing
+        fig, ax = plt.subplots()
+        ax.set_title(k_name)
+        ax.scatter(Xtest_s[:, overall_time_dim], pred_mean, c = 'Red', alpha=.15)
+        ax.scatter(Xtest_s[:, overall_time_dim], ytest, c='Blue', alpha=.15)
+        plt.savefig(model_name + "_" + "_".join([k_name,
+                                               o_name,
+                                               str(fold),
+                                               str(year),
+                                               ]) + ".png")
 
         ## Running rmse
         working = pd.DataFrame(columns=["Code", "RMSE", "Wghted RMSE", "Cont RMSE",
@@ -333,7 +331,7 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
                                                ])
 
         working.loc[0, "Epoch"] = running_epoch
-        working.loc[0, "RMSE"] = np.sqrt(np.mean((pred_mean - ytest_s)[:, 0] ** 2))
+        working.loc[0, "RMSE"] = np.sqrt(np.mean((pred_mean - ytest)[:, 0] ** 2))
 
         # For location-weighted RMSE, we assume stratified sample of stations,
         # 1st group is continuous stations, 2nd group is discrete statons
@@ -342,18 +340,18 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
         if np.sum(test_types) > 0 and np.sum(np.logical_not(test_types)) > 0:
             # Weighted RMSE
             working.loc[0, "Wghted RMSE"] = np.sqrt(
-                .5 * np.nanmean(np.where(test_types, (pred_mean - ytest_s)[:, 0], np.nan) ** 2)
-                + .5 * np.nanmean(np.where(test_types == False, (pred_mean - ytest_s)[:, 0], np.nan) ** 2)
+                .5 * np.nanmean(np.where(test_types, (pred_mean - ytest)[:, 0], np.nan) ** 2)
+                + .5 * np.nanmean(np.where(test_types == False, (pred_mean - ytest)[:, 0], np.nan) ** 2)
             )
         if np.sum(test_types) > 0:
             # For RMSE of continuous stations only
             working.loc[0, "Cont RMSE"] = np.sqrt(
-                np.nanmean(np.where(test_types, (pred_mean - ytest_s)[:, 0], np.nan) ** 2)
+                np.nanmean(np.where(test_types, (pred_mean - ytest)[:, 0], np.nan) ** 2)
             )
         if np.sum(np.logical_not(test_types)) > 0:
             # For RMSE of discrete stations only
             working.loc[0, "Discrete RMSE"] = np.sqrt(
-                np.nanmean(np.where(test_types == False, (pred_mean - ytest_s)[:, 0], np.nan) ** 2)
+                np.nanmean(np.where(test_types == False, (pred_mean - ytest)[:, 0], np.nan) ** 2)
             )
 
         # Std dev of y
@@ -378,7 +376,7 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
       training_time = end_time-start_time
 
       #Defining characteristics of this loop (order here must match characteristic_names var)
-      characteristics = [k_name, o_name, fold, year, "," .join(indep_var), area, method,  spatial_pca,  model_name,  notes,  M,  epochs_per_fold, Z]
+      characteristics = [k_name, o_name, fold, year, "," .join([var for var in indep_var if type(var) is str]), area, method,  spatial_pca,  model_name,  notes,  M,  epochs_per_fold, Z]
       assert(len(characteristics) == len(characteristic_names))
 
       #Storing Params
@@ -390,15 +388,16 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
       working[characteristic_names] = pd.DataFrame([characteristics], index=working.index)
       agg_params=pd.concat([agg_params, working])
 
-      #Predicting
+      # Predicting
       pred_mean, pred_var = m.predict_y(Xtest_s)
-      #pred_mean=pred_mean+ytrain_mean
+      pred_mean = pred_mean * ytrain_std + ytrain_mean
+      pred_var = pred_var * (ytrain_std ** 2)
 
       #Storing Predictions
       working=pd.DataFrame(columns=["RMSE", "Wghted RMSE", "Cont RMSE",
                                     "Discrete RMSE", "y_std"], index=[0])
 
-      working.loc[0, "RMSE"]=np.sqrt(np.mean((pred_mean-ytest_s)[:, 0]**2))
+      working.loc[0, "RMSE"]=np.sqrt(np.mean((pred_mean-ytest)[:, 0]**2))
 
       #For location-weighted RMSE, we assume stratified sample of stations,
       #1st group is continuous stations, 2nd group is discrete statons
@@ -407,18 +406,18 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
       if np.sum(test_types)>0 and np.sum(np.logical_not(test_types))>0:
         #Weighted RMSE
         working.loc[0, "Wghted RMSE"]= np.sqrt(
-            .5*np.nanmean(np.where(test_types, (pred_mean-ytest_s)[:, 0], np.nan)**2)
-            + .5*np.nanmean(np.where(test_types==False, (pred_mean-ytest_s)[:, 0], np.nan)**2)
+            .5*np.nanmean(np.where(test_types, (pred_mean-ytest)[:, 0], np.nan)**2)
+            + .5*np.nanmean(np.where(test_types==False, (pred_mean-ytest)[:, 0], np.nan)**2)
         )
       if np.sum(test_types)>0:
         #For RMSE of continuous stations only
         working.loc[0, "Cont RMSE"]=np.sqrt(
-          np.nanmean(np.where(test_types, (pred_mean-ytest_s)[:,0], np.nan)**2)
+          np.nanmean(np.where(test_types, (pred_mean-ytest)[:,0], np.nan)**2)
         )
       if np.sum(np.logical_not(test_types))>0:
         #For RMSE of discrete stations only
         working.loc[0, "Discrete RMSE"]=np.sqrt(
-        np.nanmean(np.where(test_types==False, (pred_mean-ytest_s)[:, 0], np.nan)**2)
+        np.nanmean(np.where(test_types==False, (pred_mean-ytest)[:, 0], np.nan)**2)
         )
 
       #Std dev of y
@@ -529,21 +528,6 @@ agg_running_rmse.to_csv(running_rmse_path)
 assert(sum(list(agg_models.index.str[:18]==".inducing_variable"))==1)
 ind_index = list(agg_models.index.str[:18]==".inducing_variable").index(True)
 print(ind_index)
-
-
-## Saving inducing variables specifically
-manual_output = agg_models.values[:][ind_index].copy()
-index = agg_models.columns.values
-
-for i in range(len(index)):
-  working = manual_output[i].numpy()
-  # print(manual_output[i])
-  output = pd.DataFrame(working, columns = indep_var)
-
-  index_parts = index[i].split("_")[1:-3] + index[i].split("_")[-2:]
-  name = "_".join(index_parts)
-
-  output.to_csv(model_name + "_inducing_variables_" + name + ".csv")
 
 ## Printing quick summary of results
 print(agg_rmse.loc[agg_rmse["Kernel"]=="matern32_rbf_sin_intra"].groupby(["Year", "Fold"])[["RMSE", "Training Time"]].mean())
