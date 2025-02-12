@@ -28,6 +28,7 @@ from gpflow.utilities import to_default_float
 #These should stay the same
 time_dim=[0]
 overall_time_dim=[1]
+minute_dim = [5]
 dep_var=["Temperature (C)"]
 group_vars = ["Station ID"]
 years=[2019, 2020, 2021, 2022, 2023]
@@ -44,18 +45,18 @@ batch_size = 32
 epochs_per_fold=40
 logging_epoch_freq=10
 # This next condition enforces 1 graph/fold post training
-graphing_epoch_freq=40
+graphing_epoch_freq=10
 # maximum iterations
 maxiter=10000
 
 #These are dependent on specific version of the model
-indep_var=["Day", "Overall_Day", "Latitude", "Longitude", "embay_dist"]
+indep_var=["Day", "Overall_Day", "Latitude", "Longitude", "embay_dist", "minute_of_day"]
 area="ES"
 method="SVGP"
 spatial_pca= False
-notes="Same as 3.10 but now used on data with outliers removed and k folds shuffled."
-model_name="3.11"
-within_year_vars = np.setdiff1d(np.arange(len(indep_var)), np.array(overall_time_dim))
+notes="Like 4.1 but now using dataset without outliers and shuffled folds."
+model_name="4.2"
+within_year_vars = np.setdiff1d(np.arange(len(indep_var)), np.array(overall_time_dim + minute_dim))
 # Characteristic Map
 characteristic_names = ['Kernel', 'Optimizer', 'Fold', 'Year', 'Independent Vars', 'Area', 'Method', 'Spatial PCA', 'Model Name', 'Notes', 'Inducing Locations', 'Epochs/Fold', 'Inducing Variables']
 
@@ -89,8 +90,6 @@ df["Overall_Day"]= 365*(df["Year"]-min(years)) + df["Day"]
 df.drop("Unnamed: 0", axis=1, inplace=True)
 df.reset_index(inplace=True, drop=True)
 df[indep_var]=df[indep_var].astype(float)
-
-# print(df.loc[df["Year"]==2023, :])
 
 #
 
@@ -136,8 +135,10 @@ def get_kernels():
                         active_dims=overall_time_dim)
 
 ## Kernels using cyclical day of year
-  # sin_1 = gpflow.kernels.Cosine(lengthscales=[365], variance=.5, active_dims=time_dim)
-  sin_2 = gpflow.kernels.Cosine(lengthscales=[365], active_dims=time_dim)
+  sin_1 = gpflow.kernels.Cosine(lengthscales=[365], active_dims=time_dim)
+
+  ## Kernels using cyclical time of day
+  sin_2 = gpflow.kernels.Cosine(lengthscales=[1440], active_dims=minute_dim)
 
   #Testing set (all have an rbf for time within year), note: sin must be last!
   kernels={
@@ -145,8 +146,7 @@ def get_kernels():
       # "matern32_rbf_intra": matern32_1 + rbf_time_1
       # "matern32_rbf_intra_sin": matern32_2 + rbf_time_2 + sin_1
       # "rbf_matern32_plus": rbf_1 + matern32_3 + rbf_time_3
-      "rbf_rbf_matern32_sin": rbf_2 + matern32_4 + rbf_time_4 + sin_2
-
+      "rbf_rbf_matern32_sin": rbf_2 + matern32_4 + rbf_time_4 + sin_1 + sin_2
       # "rbf_rq": rbf_3 + rq_1,
       # "matern32_rq": matern32_3 +rq_2
   }
@@ -181,6 +181,9 @@ def standardize(X, y):
     Xmean[time_dim] = 0
     Xstd[time_dim] = 1
 
+    Xmean[minute_dim] = 0
+    Xstd[minute_dim] = 1
+
   X_s=(X-Xmean)/Xstd
   y_s=y-ymean
 
@@ -196,8 +199,6 @@ print(standardize(np.arange(1,10), np.arange(1,10)*10))
 train_sample=df.sample(1000)
 Xtrain_d = train_sample[indep_var].values
 ytrain_d = train_sample[dep_var].values
-data = (Xtrain_d, ytrain_d)
-tensor_data = tuple(map(tf.convert_to_tensor, data))
 
 #Building model in each fold
 def CV_fold(Xtrain, Xtest, ytrain, ytest,
@@ -220,6 +221,10 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
       Xtest_s, ytest_s, ytest_mean =standardize(Xtest, ytest)
       start_time=datetime.datetime.now()
 
+      #Tensor for ELBO calculation
+      data = (Xtrain_s, ytrain_s)
+      tensor_data = tuple(map(tf.convert_to_tensor, data))
+
   # From here on out, the SVGP is implemented
 
       # Shuffling data to get inducing points (later this will be replaced with intentional selection)
@@ -228,7 +233,7 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
 
       # Initialize inducing locations to M random inputs in the dataset
       Z = shuffled[:M, :]
-      N = len(Xtrain_s)
+      N = tf.constant(len(Xtrain_s))
 
       # Define Model
       m = gpflow.models.SVGP(kernel=kernel,
@@ -241,6 +246,7 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
       ## Cyclical Sin
       if k_name[-3:]=="sin":
         gpflow.utilities.set_trainable(m.kernel.kernels[-1].lengthscales, False)
+        gpflow.utilities.set_trainable(m.kernel.kernels[-2].lengthscales, False)
       #   gpflow.utilities.set_trainable(m.kernel.kernels[-1].variance, False)
 
       ## Inducing variables
@@ -305,16 +311,16 @@ def CV_fold(Xtrain, Xtest, ytrain, ytest,
         ## Predicting for monitoring
         pred_mean, pred_var = m.predict_y(Xtest_s)
 
-        ## Graphing
-        fig, ax = plt.subplots()
-        ax.set_title(k_name)
-        ax.scatter(Xtest_s[:, overall_time_dim], pred_mean, c = 'Red', alpha=.15)
-        ax.scatter(Xtest_s[:, overall_time_dim], ytest_s, c='Blue', alpha=.15)
-        plt.savefig(model_name + "_" + "_".join([k_name,
-                                               o_name,
-                                               str(fold),
-                                               str(year),
-                                               ]) + ".png")
+        # ## Graphing
+        # fig, ax = plt.subplots()
+        # ax.set_title(k_name)
+        # ax.scatter(Xtest_s[:, overall_time_dim], pred_mean, c = 'Red', alpha=.15)
+        # ax.scatter(Xtest_s[:, overall_time_dim], ytest_s, c='Blue', alpha=.15)
+        # plt.savefig(model_name + "_" + "_".join([k_name,
+        #                                        o_name,
+        #                                        str(fold),
+        #                                        str(year),
+        #                                        ]) + ".png")
 
         ## Running rmse
         working = pd.DataFrame(columns=["Code", "RMSE", "Wghted RMSE", "Cont RMSE",
