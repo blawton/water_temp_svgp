@@ -1,0 +1,6 @@
+*.csv
+*.tif
+podaac_satellite_data/
+config_with_new_names.yml
+.idea/
+*.xlsx
