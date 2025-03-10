@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import GroupKFold as groupkfold
 
-test_input = 'agg_daily_morning_coastal_features.csv'
+test_input = 'Data/Aggregate/agg_daily_morning_coastal_features.csv'
 
 #Helper function for randomly choosing folds
 def get_splits(X, y, groups, folds):

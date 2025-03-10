@@ -32,11 +32,6 @@ pd.options.display.max_columns=150
 
 # Originally, this file was in the space version of Geostatistics Workbook, but now it is a standalone file that can be used for the space only or the space and time data
 
-#Navigating to root of repo
-# while(not os.path.basename(os.getcwd()).startswith("lis_gp")):
-#     os.chdir("..")
-# assert(os.path.basename(os.getcwd()).startswith("lis_gp"))
-
 # +
 #Loading paths config.yml
 import yaml
